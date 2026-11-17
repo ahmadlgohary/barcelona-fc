@@ -19,6 +19,15 @@ from games import GAME, GAMES, half_video_blocks, require, source_frames
 HOME, AWAY, DEAD = range(3)
 LABELS = "HAD"
 STEP_FRAMES = 5
+# Field-wide stoppage cue. Activity is the share of tracked players moving at >= 2 m/s. During play
+# players are constantly repositioning; at a stoppage nearly everyone walks. Full evidence when at
+# most 1 in 20 players runs, none once 1 in 7 does, averaged over a 3 s window so a single slow
+# moment in open play does not count.
+QUIET_WINDOW_S = 3.0
+QUIET_FULL = 0.05
+QUIET_ZERO = 0.15
+QUIET_WEIGHT = 0.5             # per 0.2 s block; a 5 s stoppage outweighs entering and leaving D
+QUIET_CONTACT_DISCOUNT = 0.6
 PHASE_WEIGHT = {
     "attacking transition": 0.32,
     "build up": 0.29,
@@ -279,10 +288,35 @@ def tag_evidence(blocks, first_frame, tags, pitch, blocks_per_second):
     return phases, restart_live, restart_dead
 
 
+def smoothed_activity(blocks, blocks_per_second):
+    """Centred mean of team activity over QUIET_WINDOW_S seconds, ignoring missing samples."""
+    half = round(QUIET_WINDOW_S * blocks_per_second / 2)
+    total = [0.0]
+    count = [0]
+    for block in blocks:
+        valid = math.isfinite(block.activity)
+        total.append(total[-1] + (block.activity if valid else 0.0))
+        count.append(count[-1] + valid)
+    result = []
+    for i in range(len(blocks)):
+        low, high = max(0, i - half), min(len(blocks), i + half + 1)
+        samples = count[high] - count[low]
+        result.append((total[high] - total[low]) / samples if samples else math.nan)
+    return result
+
+
+def quiet_evidence(activity):
+    """1 when almost nobody runs, 0 at normal pace: the whole field stopping is a stoppage."""
+    if not math.isfinite(activity):
+        return 0.0
+    return min(1.0, max(0.0, (QUIET_ZERO - activity) / (QUIET_ZERO - QUIET_FULL)))
+
+
 def state_evidence(blocks, phases, restart_live, restart_dead, blocks_per_second):
     emissions = []
     still_blocks = missing_blocks = 0
     recent_out = 0.0
+    field_activity = smoothed_activity(blocks, blocks_per_second)
     for i, block in enumerate(blocks):
         missing = block.ball is None
         moving = block.speed > 2.4 and block.outside < 0.4
@@ -311,8 +345,16 @@ def state_evidence(blocks, phases, restart_live, restart_dead, blocks_per_second
             dead += 0.055
         if not moving or restart_dead[i] >= 1.0:
             dead += restart_dead[i] * (1.0 if still or missing or quiet else 0.45)
+        # Field-wide stoppage: sustained walking pace with the ball not in motion. This needs no
+        # ball position, which matters because the ball is often untracked during stoppages, and
+        # most stoppages (fouls, many throw-ins) have no Smart Tagging set piece.
+        field_quiet = 0.0 if moving else quiet_evidence(field_activity[i])
+        dead += QUIET_WEIGHT * field_quiet
         dead -= 0.6 * restart_live[i]
         contact_multiplier = 1.20 * (1 - min(1.0, 2 * block.outside))
+        # A player standing over the ball while nobody runs is setting up a restart, not
+        # carrying a possession.
+        contact_multiplier *= 1 - QUIET_CONTACT_DISCOUNT * field_quiet
         if stationary or restart_dead[i] >= 1.0:
             # The player standing over a ball before an automated restart cue is
             # weaker evidence of live possession than a moving player's contact.

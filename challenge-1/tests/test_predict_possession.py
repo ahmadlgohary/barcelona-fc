@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 
 from games import GAME, half_video_blocks, source_frames
-from src.main import AWAY, HOME, Block, decode_states, read_tracking, state_evidence
+from src.main import AWAY, DEAD, HOME, Block, decode_states, read_tracking, state_evidence
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,6 +87,27 @@ class PossessionTest(unittest.TestCase):
         emissions = state_evidence(blocks, phases, restarts, restarts, 5)
         path = decode_states(blocks, emissions, phases, restarts, restarts)
         self.assertEqual(path, [HOME] * 8 + [AWAY] * 50)
+
+    def test_untagged_field_wide_stoppage_is_dead_ball(self):
+        # A foul with no Smart Tagging set piece: the ball vanishes and everyone walks for 12 s.
+        playing = Block((52.0, 34.0), 4.0, (1.0, 0.0), 0.5, 0.0)
+        stopped = Block(None, float("nan"), (0.0, 0.0), 0.0, 0.0)
+        blocks = [playing] * 25 + [stopped] * 60 + [playing] * 25
+        none = [(0.0, 0.0)] * len(blocks)
+        zeros = [0.0] * len(blocks)
+        path = decode_states(blocks, state_evidence(blocks, none, zeros, zeros, 5), none, zeros, zeros)
+        self.assertEqual(path[:25], [HOME] * 25)
+        self.assertEqual(path[40:70], [DEAD] * 30)
+        self.assertEqual(path[-10:], [HOME] * 10)
+
+    def test_slow_circulation_with_a_moving_ball_stays_live(self):
+        # Everybody jogs, but the ball is being passed around: open play, not a stoppage.
+        circulating = Block((30.0, 34.0), 6.0, (0.6, 0.0), 0.02, 0.0)
+        blocks = [circulating] * 80
+        none = [(0.0, 0.0)] * len(blocks)
+        zeros = [0.0] * len(blocks)
+        path = decode_states(blocks, state_evidence(blocks, none, zeros, zeros, 5), none, zeros, zeros)
+        self.assertEqual(path, [HOME] * 80)
 
     def test_outside_ball_cannot_supply_player_control(self):
         with tempfile.TemporaryDirectory() as directory:
