@@ -53,8 +53,9 @@ getting to the actual question. See [CHALLENGE.md](CHALLENGE.md).
 
 ## Run the team solution
 
-Run these commands from `challenge-1/` with Python 3.13.9. The predictor uses the standard
-library and reads these files under the bundle root.
+Run these commands from `challenge-1/` with Python 3.13.9. The predictor uses only the standard
+library, so generating a submission requires no package installation. `requirements.txt` pins the
+NumPy and pandas versions used by the evaluator and starter baseline.
 
 ```text
 tactical/BAR-ATH_tactical_atd.xml
@@ -79,8 +80,8 @@ The predictor writes 199,319 rows in tactical video frame order. The match video
 with the downloaded bundle.
 
 ```bash
-python -m unittest discover -s tests -v
 python -m pip install -r requirements.txt
+python -m unittest discover -s tests -v
 python evaluation/validate_submission.py output/TEAM_NAME.csv
 ```
 

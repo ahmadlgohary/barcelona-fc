@@ -1,10 +1,9 @@
-# Everything the evaluation needs. Deliberately two lines.
-#
-# The scorer is dependency-light on purpose: no sklearn, no torch, nothing that pins a Python
-# version. It runs under 3.8 and 3.11 alike and produces identical output, so "it scored
-# differently on my machine" is not a conversation anyone has to have.
-#
-# Optional tooling -- the ATD loader and anything that opens the video -- lives in
-# requirements-starter.txt.
-numpy
-pandas
+# Direct dependencies for the evaluator and starter baseline, not the submission generator
+# (src/main.py uses only the Python standard library).
+# Pins are selected by interpreter version so the published Python 3.8+ range remains installable.
+numpy==1.24.4; python_version < "3.9"
+pandas==2.0.3; python_version < "3.9"
+numpy==1.26.4; python_version >= "3.9" and python_version < "3.12"
+pandas==2.2.3; python_version >= "3.9" and python_version < "3.12"
+numpy==2.5.5; python_version >= "3.12"
+pandas==3.1.1; python_version >= "3.12"
