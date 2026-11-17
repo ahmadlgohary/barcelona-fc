@@ -28,6 +28,18 @@ QUIET_FULL = 0.05
 QUIET_ZERO = 0.15
 QUIET_WEIGHT = 0.5             # per 0.2 s block; a 5 s stoppage outweighs entering and leaving D
 QUIET_CONTACT_DISCOUNT = 0.6
+# Laws of the Game, law 15-17: when the ball leaves the pitch, the team that did not touch it
+# last restarts (throw-in, goal kick or corner). Look back up to 3 s for the last clear contact.
+LAST_TOUCH_LOOKBACK_S = 3.0
+LAST_TOUCH_MIN = 0.25
+LAST_TOUCH_WEIGHT = 0.5
+RESTART_EVIDENCE_S = 1.2       # how long restart-team evidence lasts after play resumes
+# Law 8: after a goal the ball is dead until the conceding team kicks off.
+GOAL_DEAD = 1.5                # same strength as the lead-in to a half's opening kick-off
+GOAL_MAX_GAP_S = 180.0         # a kick-off later than this is not the one for that goal
+# Boundary refinement: decoding works in blocks, so each change is re-placed at frame precision
+# within one block either side, using the per-frame evidence for the two states involved.
+MOVING_BALL = 2.4              # m/s, same threshold as the block-level "moving" cue
 PHASE_WEIGHT = {
     "attacking transition": 0.32,
     "build up": 0.29,
@@ -259,13 +271,25 @@ def tag_evidence(blocks, first_frame, tags, pitch, blocks_per_second):
     restart_live = [0.0] * len(blocks)
     restart_dead = [0.0] * len(blocks)
     clip_end = first_frame + STEP_FRAMES * len(blocks)
+    goals = [tag for tag in tags if tag.code == "goals"]
     for tag in tags:
         if tag.end <= first_frame or tag.start >= clip_end or tag.end <= tag.start:
             continue
         start = (tag.start - first_frame) // STEP_FRAMES
         end = (tag.end - first_frame + STEP_FRAMES - 1) // STEP_FRAMES
         if tag.code == "set pieces":
+            goal = None
+            if tag.kind == "kick off (after goal)":
+                earlier = [g for g in goals if g.start < tag.start
+                           and tag.start - g.end <= GOAL_MAX_GAP_S * STEP_FRAMES * blocks_per_second]
+                goal = earlier[-1] if earlier else None
+                if tag.team is None and goal is not None and goal.team is not None:
+                    tag = tag._replace(team=1 - goal.team)  # the conceding side kicks off
             restart, confidence = align_restart(blocks, start, end, tag, pitch, blocks_per_second)
+            if goal is not None:
+                goal_end = max(0, (goal.end - first_frame) // STEP_FRAMES)
+                for i in range(goal_end, restart):
+                    restart_dead[i] = max(restart_dead[i], GOAL_DEAD)
             pre_window = round(24 * blocks_per_second)
             pre_start = max(0, restart - pre_window)
             if tag.kind == "kick off (start)" and restart < 180 * blocks_per_second:
@@ -408,26 +432,114 @@ def decode_states(blocks, emissions, phases, restart_live, restart_dead):
     return list(reversed(path))
 
 
+def last_touch(blocks, out, blocks_per_second):
+    """Team with the last clear contact before the ball left the pitch at block `out`, or None."""
+    for i in range(out, max(-1, out - round(LAST_TOUCH_LOOKBACK_S * blocks_per_second)), -1):
+        home, away = blocks[i].contact
+        if max(home, away) >= LAST_TOUCH_MIN and abs(home - away) > 0.1:
+            return HOME if home > away else AWAY
+    return None
+
+
+def out_of_play_restarts(blocks, path, blocks_per_second):
+    """[(first live block, restarting team)] for stoppages that began with the ball going out."""
+    restarts = []
+    i = 0
+    while i < len(path):
+        if path[i] != DEAD:
+            i += 1
+            continue
+        j = i
+        while j < len(path) and path[j] == DEAD:
+            j += 1
+        if j < len(path):
+            window = range(max(0, i - round(2 * blocks_per_second)),
+                           min(j, i + round(5 * blocks_per_second)))
+            out = next((k for k in window if blocks[k].outside >= 0.4), None)
+            if out is not None:
+                toucher = last_touch(blocks, out, blocks_per_second)
+                if toucher is not None:
+                    restarts.append((j, 1 - toucher))
+        i = j
+    return restarts
+
+
+def frame_score(observation, state, pitch):
+    """Per-frame evidence for one state, used only to place a boundary inside a block."""
+    ball = observation.ball
+    outside = ball is not None and is_outside_pitch(ball, pitch)
+    if state == DEAD:
+        return 1.0 if outside else 0.0
+    moving = (ball is not None and not outside and math.isfinite(ball[2])
+              and ball[2] > MOVING_BALL)
+    return observation.contact[state] + (1.0 if moving else 0.0)
+
+
+def refine_boundaries(path, tracking, pitch):
+    """Per-frame states, with every block boundary moved to the best frame within one block.
+
+    Only boundaries between two segments of at least two blocks are moved, so neighbouring
+    refinement windows never overlap. Ties keep the boundary closest to where decoding put it.
+    """
+    states = [state for state in path for _ in range(STEP_FRAMES)][:len(tracking)]
+    for b in range(2, len(path) - 1):
+        source, target = path[b - 1], path[b]
+        if source == target or path[b - 2] != source or path[b + 1] != target:
+            continue
+        boundary = b * STEP_FRAMES
+        low, high = boundary - STEP_FRAMES, min(boundary + STEP_FRAMES, len(tracking))
+        if boundary >= high:
+            continue
+        difference = [frame_score(tracking[f], target, pitch) - frame_score(tracking[f], source, pitch)
+                      for f in range(low, high)]
+        suffix = [0.0] * (len(difference) + 1)
+        for k in range(len(difference) - 1, -1, -1):
+            suffix[k] = suffix[k + 1] + difference[k]
+        base = suffix[boundary - low]
+        best, best_gain = boundary, 0.0
+        for frame in range(low, high + 1):
+            gain = suffix[frame - low] - base
+            if gain > best_gain + 1e-9 or (abs(gain - best_gain) <= 1e-9
+                                           and abs(frame - boundary) < abs(best - boundary)):
+                best, best_gain = frame, gain
+        for f in range(low, high):
+            states[f] = source if f < best else target
+    return states
+
+
 def predict(data_dir=None):
     metadata, raw_tracking, smart_tagging = require(
         ("atd_meta", "atd_raw", "smart_tagging"), data_dir=data_dir
     )
     config = GAMES[GAME]
     fps, pitch = config["fps"], config["pitch"]
+    blocks_per_second = fps / STEP_FRAMES
     frame_count = source_frames()
     slots, team_names = read_teams(metadata)
     tags = read_tags(smart_tagging, team_names, fps)
     tracking = read_tracking(raw_tracking, slots, pitch, frame_count)
     labels = ["X"] * frame_count
     for _, first, last in half_video_blocks(GAME):
-        blocks = build_blocks(tracking[first:last + 1], pitch, fps)
-        tag_scores = tag_evidence(blocks, first, tags, pitch, fps / STEP_FRAMES)
-        emissions = state_evidence(blocks, *tag_scores, fps / STEP_FRAMES)
+        half = tracking[first:last + 1]
+        blocks = build_blocks(half, pitch, fps)
+        tag_scores = tag_evidence(blocks, first, tags, pitch, blocks_per_second)
+        emissions = state_evidence(blocks, *tag_scores, blocks_per_second)
         path = decode_states(blocks, emissions, *tag_scores)
-        for i, state in enumerate(path):
-            start = first + i * STEP_FRAMES
-            stop = min(start + STEP_FRAMES, last + 1)
-            labels[start:stop] = [LABELS[state]] * (stop - start)
+
+        # Second pass: a stoppage that began with the ball going out is restarted by the team
+        # that did not touch it last. Add that evidence where play resumes and decode again.
+        phases = tag_scores[0]
+        restarts = out_of_play_restarts(blocks, path, blocks_per_second)
+        span = round(RESTART_EVIDENCE_S * blocks_per_second)
+        for first_live, team in restarts:
+            for i in range(first_live, min(len(blocks), first_live + span)):
+                phases[i][team] = max(phases[i][team], LAST_TOUCH_WEIGHT)
+        if restarts:
+            emissions = state_evidence(blocks, *tag_scores, blocks_per_second)
+            path = decode_states(blocks, emissions, *tag_scores)
+
+        states = refine_boundaries(path, half, pitch)
+        labels[first:last + 1] = [LABELS[state] for state in states]
     return labels
 
 

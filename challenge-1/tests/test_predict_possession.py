@@ -7,7 +7,8 @@ import unittest
 from pathlib import Path
 
 from games import GAME, half_video_blocks, source_frames
-from src.main import AWAY, DEAD, HOME, Block, decode_states, read_tracking, state_evidence
+from src.main import (AWAY, DEAD, HOME, Block, Observation, Tag, decode_states, out_of_play_restarts,
+                      read_tracking, refine_boundaries, state_evidence, tag_evidence)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -108,6 +109,34 @@ class PossessionTest(unittest.TestCase):
         zeros = [0.0] * len(blocks)
         path = decode_states(blocks, state_evidence(blocks, none, zeros, zeros, 5), none, zeros, zeros)
         self.assertEqual(path, [HOME] * 80)
+
+    def test_ball_out_is_restarted_by_the_team_that_did_not_touch_it_last(self):
+        away_control = Block((100.0, 34.0), 4.0, (0.0, 1.0), 0.5, 0.0)
+        out = Block((106.0, 34.0), 5.0, (0.0, 0.0), 0.3, 1.0)
+        stopped = Block(None, float("nan"), (0.0, 0.0), 0.0, 0.0)
+        blocks = [away_control] * 10 + [out] * 5 + [stopped] * 30 + [away_control] * 20
+        path = [AWAY] * 10 + [DEAD] * 35 + [HOME] * 20
+        self.assertEqual(out_of_play_restarts(blocks, path, 5), [(45, HOME)])
+
+    def test_goal_is_dead_until_the_conceding_team_kicks_off(self):
+        centre = (105.3 / 2, 34.0)
+        still = Block(centre, 0.0, (0.0, 0.0), 0.0, 0.0)
+        moving = Block(centre, 5.0, (0.5, 0.5), 0.5, 0.0)
+        blocks = [still] * 60 + [moving] * 40
+        tags = [Tag(50, 100, "goals", "", HOME),
+                Tag(275, 325, "set pieces", "kick off (after goal)", None)]
+        phases, _, restart_dead = tag_evidence(blocks, 0, tags, (105.3, 68.0), 5)
+        self.assertTrue(all(value >= 1.5 for value in restart_dead[20:55]))
+        first_away = next(i for i, phase in enumerate(phases) if phase[AWAY] > 0.0)
+        self.assertTrue(55 <= first_away <= 65)
+        self.assertTrue(all(phase[HOME] == 0.0 for phase in phases[55:]))
+
+    def test_boundaries_move_to_the_frame_where_control_changes(self):
+        home = Observation((50.0, 34.0, 4.0), (1.0, 0.0), 0.5)
+        away = Observation((50.0, 34.0, 4.0), (0.0, 1.0), 0.5)
+        tracking = [home] * 13 + [away] * 17
+        states = refine_boundaries([HOME] * 3 + [AWAY] * 3, tracking, (105.3, 68.0))
+        self.assertEqual(states, [HOME] * 13 + [AWAY] * 17)
 
     def test_outside_ball_cannot_supply_player_control(self):
         with tempfile.TemporaryDirectory() as directory:
