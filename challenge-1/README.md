@@ -51,6 +51,43 @@ getting to the actual question. See [CHALLENGE.md](CHALLENGE.md).
 
 ---
 
+## Run the team solution
+
+Run these commands from `challenge-1/` with Python 3.13.9. The predictor uses the standard
+library and reads these files under the bundle root.
+
+```text
+tactical/BAR-ATH_tactical_atd.xml
+tactical/BAR-ATH_tactical_atd.txt
+tactical/BAR-ATH_tactical_smart_tagging.xml
+```
+
+Set the path to the downloaded bundle and replace `TEAM_NAME` with the registered team name.
+
+```bash
+python src/main.py --data-dir /path/to/match-bundle --output output/TEAM_NAME.csv
+```
+
+For a bundle in Downloads on Windows, run this in PowerShell.
+
+```powershell
+python src/main.py --data-dir "$env:USERPROFILE\Downloads\data" --output output/TEAM_NAME.csv
+```
+
+You can also set `MTAH_DATA_DIR` or unpack the three files under `challenge-1/data/`.
+The predictor writes 199,319 rows in tactical video frame order. The match videos can stay
+with the downloaded bundle.
+
+```bash
+python -m unittest discover -s tests -v
+python -m pip install -r requirements.txt
+python evaluation/validate_submission.py output/TEAM_NAME.csv
+```
+
+See [TECHNICAL.md](TECHNICAL.md) for the method and [SUBMISSION.md](SUBMISSION.md) for the upload requirements.
+
+---
+
 ## Try it right now
 
 The scorer, a 5-minute ground truth and four working baselines are in this repository. No
