@@ -67,6 +67,15 @@ INTERCEPT_EVIDENCE_S = 1.0
 # Offsides go the other way and are far rarer, hence a weaker weight than the last-touch rule.
 FOUL_RESTART_WEIGHT = 0.3
 FOUL_MIN_STOPPAGE_S = 2.0
+# Ball carrier: the same tracked player stays within CARRY_RADIUS of the ball, moving with it, for
+# at least CARRY_MIN_S. That is a player in control (dribbling, shielding, receiving and turning),
+# the challenge's own proxy for controlled possession, so that team's contact evidence is raised
+# to full strength. A tracker identity switch simply ends the run.
+CARRY_RADIUS = 1.5             # m
+CARRY_MIN_S = 0.5
+CARRY_VELOCITY_FRAMES = 2      # velocities over +-2 frames (0.16 s)
+CARRY_MAX_VELOCITY_DIFF = 2.0  # m/s between player and ball
+CARRY_CONTACT = 1.0            # the carrier's team contact is raised to this
 PHASE_WEIGHT = {
     "attacking transition": 0.32,
     "build up": 0.29,
@@ -88,6 +97,7 @@ class Observation(NamedTuple):
     contact: tuple
     activity: float
     shape: Optional[tuple] = None   # per team (mean x, mean y, sd x, sd y, min x, max x)
+    nearest: Optional[tuple] = None  # closest player to an on-pitch ball: (slot, team, metres, x, y)
 
 
 class Block(NamedTuple):
@@ -187,7 +197,8 @@ def read_tracking(path, slots, pitch, frame_count):
                 running = speed_samples = 0
                 # count, sum x, sum y, sum x^2, sum y^2, min x, max x per team
                 moments = [[0, 0.0, 0.0, 0.0, 0.0, math.inf, -math.inf] for _ in (HOME, AWAY)]
-                for team, group in zip(slots, groups):
+                closest = None
+                for slot, (team, group) in enumerate(zip(slots, groups)):
                     player = coordinates(group, pitch)
                     if player is None:
                         continue
@@ -206,15 +217,62 @@ def read_tracking(path, slots, pitch, frame_count):
                     if ball_on_pitch:
                         distance = math.hypot(x - ball[0], y - ball[1])
                         nearest[team] = min(nearest[team], distance)
+                        if closest is None or distance < closest[2]:
+                            closest = (slot, team, distance, x, y)
 
                 contact = contact_evidence(nearest, ball[2]) if ball_on_pitch else (0.0, 0.0)
                 activity = running / speed_samples if speed_samples >= 6 else math.nan
-                data.append(Observation(ball, contact, activity, team_shape(moments)))
+                data.append(Observation(ball, contact, activity, team_shape(moments), closest))
             except ValueError as error:
                 raise ValueError(f"{path}, line {frame_id}: {error}") from error
     if len(data) != frame_count:
         raise ValueError(f"{path}: expected {frame_count} tactical records, found {len(data)}")
     return data
+
+
+def carrier_frames(tracking, fps):
+    """{frame: team} for frames inside a run where one tracked player carries the ball."""
+    k = CARRY_VELOCITY_FRAMES
+    together = [None] * len(tracking)
+    for f in range(k, len(tracking) - k):
+        here, before, after = (tracking[g].nearest for g in (f, f - k, f + k))
+        if (here is None or before is None or after is None or here[2] > CARRY_RADIUS
+                or not here[0] == before[0] == after[0]):
+            continue
+        ball_before, ball_after = tracking[f - k].ball, tracking[f + k].ball
+        seconds = 2 * k / fps
+        ball_velocity = ((ball_after[0] - ball_before[0]) / seconds,
+                         (ball_after[1] - ball_before[1]) / seconds)
+        player_velocity = ((after[3] - before[3]) / seconds, (after[4] - before[4]) / seconds)
+        if math.hypot(ball_velocity[0] - player_velocity[0],
+                      ball_velocity[1] - player_velocity[1]) <= CARRY_MAX_VELOCITY_DIFF:
+            together[f] = (here[0], here[1])
+
+    carriers = {}
+    minimum = round(CARRY_MIN_S * fps)
+    f = 0
+    while f < len(together):
+        if together[f] is None:
+            f += 1
+            continue
+        g = f
+        while g < len(together) and together[g] == together[f]:
+            g += 1
+        if g - f >= minimum:
+            for frame in range(f, g):
+                carriers[frame] = together[f][1]
+        f = g
+    return carriers
+
+
+def apply_carriers(tracking, fps):
+    """Tracking with contact evidence strengthened wherever a ball carrier is found."""
+    result = list(tracking)
+    for frame, team in carrier_frames(tracking, fps).items():
+        contact = list(result[frame].contact)
+        contact[team] = max(contact[team], CARRY_CONTACT)
+        result[frame] = result[frame]._replace(contact=tuple(contact))
+    return result
 
 
 def read_tags(path, team_names, fps):
@@ -769,7 +827,7 @@ def predict(data_dir=None):
 
     halves = []
     for _, first, last in half_video_blocks(GAME):
-        half = tracking[first:last + 1]
+        half = apply_carriers(tracking[first:last + 1], fps)
         blocks = build_blocks(half, pitch, fps)
         direction = attack_direction(blocks)
         features = [shape_features(block.shape, direction, pitch) for block in blocks]

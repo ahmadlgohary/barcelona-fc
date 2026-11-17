@@ -7,9 +7,10 @@ import unittest
 from pathlib import Path
 
 from games import GAME, half_video_blocks, source_frames
-from src.main import (AWAY, DEAD, HOME, Block, Observation, Tag, attack_direction, decode_states,
-                      detect_interceptions, foul_restarts, out_of_play_restarts, read_tracking,
-                      refine_boundaries, shape_cues, state_evidence, tag_evidence)
+from src.main import (AWAY, DEAD, HOME, Block, Observation, Tag, apply_carriers, attack_direction,
+                      carrier_frames, decode_states, detect_interceptions, foul_restarts,
+                      out_of_play_restarts, read_tracking, refine_boundaries, shape_cues,
+                      state_evidence, tag_evidence)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -184,6 +185,25 @@ class PossessionTest(unittest.TestCase):
         self.assertEqual(cues[0][AWAY], 0.0)
         self.assertEqual(cues[1], [0.0, 0.0])
         self.assertEqual(cues[2], [0.0, 0.0])
+
+    def test_ball_carrier_is_a_player_moving_with_the_ball(self):
+        def frame(f, ball_x, player_x, slot=3, contact=(0.4, 0.4)):
+            return Observation((ball_x, 34.0, 5.0), contact, 0.5, None,
+                               (slot, AWAY, abs(ball_x - player_x), player_x, 34.0))
+        # Away player dribbles at 5 m/s with the ball 0.5 m ahead, an opponent equally close.
+        dribble = [frame(f, 20 + 0.2 * f + 0.5, 20 + 0.2 * f) for f in range(30)]
+        self.assertEqual(set(carrier_frames(dribble, 25).values()), {AWAY})
+        self.assertGreaterEqual(len(carrier_frames(dribble, 25)), 20)
+        boosted = apply_carriers(dribble, 25)
+        self.assertEqual(boosted[15].contact, (0.4, 1.0))
+        # The ball rolling past a standing player is not carried ...
+        passing = [frame(f, 20 + 0.6 * f, 26.0) for f in range(30)]
+        self.assertEqual(carrier_frames(passing, 25), {})
+        # ... nor is a brief touch shorter than 0.5 s ...
+        self.assertEqual(carrier_frames(dribble[:10], 25), {})
+        # ... nor a run broken by a tracker identity switch every few frames.
+        switching = [frame(f, 20 + 0.2 * f + 0.5, 20 + 0.2 * f, slot=f // 8) for f in range(30)]
+        self.assertEqual(carrier_frames(switching, 25), {})
 
     def test_outside_ball_cannot_supply_player_control(self):
         with tempfile.TemporaryDirectory() as directory:
