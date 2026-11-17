@@ -7,8 +7,9 @@ import unittest
 from pathlib import Path
 
 from games import GAME, half_video_blocks, source_frames
-from src.main import (AWAY, DEAD, HOME, Block, Observation, Tag, decode_states, out_of_play_restarts,
-                      read_tracking, refine_boundaries, state_evidence, tag_evidence)
+from src.main import (AWAY, DEAD, HOME, Block, Observation, Tag, attack_direction, decode_states,
+                      out_of_play_restarts, read_tracking, refine_boundaries, shape_cues,
+                      state_evidence, tag_evidence)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -137,6 +138,27 @@ class PossessionTest(unittest.TestCase):
         tracking = [home] * 13 + [away] * 17
         states = refine_boundaries([HOME] * 3 + [AWAY] * 3, tracking, (105.3, 68.0))
         self.assertEqual(states, [HOME] * 13 + [AWAY] * 17)
+
+    def test_attack_direction_follows_the_goalkeepers(self):
+        # Home's rearmost player near x = 3 m, away's near x = 40 m: home defends x = 0.
+        home = (40.0, 34.0, 15.0, 10.0, 3.0, 70.0)
+        away = (60.0, 34.0, 12.0, 9.0, 40.0, 101.0)
+        block = Block(None, float("nan"), (0.0, 0.0), 0.5, 0.0, (home, away))
+        self.assertEqual(attack_direction([block] * 10), 1)
+        flipped = Block(None, float("nan"), (0.0, 0.0), 0.5, 0.0, (away, home))
+        self.assertEqual(attack_direction([flipped] * 10), -1)
+
+    def test_shape_cue_is_silent_at_stoppages_and_where_the_ball_is_seen(self):
+        model = ([0.0] * 5, [1.0] * 5, [5.0, 1.0, 0.0, 0.0, 0.0, 0.0])  # logit = spread difference
+        hidden_play = Block(None, float("nan"), (0.0, 0.0), 0.5, 0.0)
+        hidden_stoppage = Block(None, float("nan"), (0.0, 0.0), 0.0, 0.0)
+        seen = Block((50.0, 34.0), 4.0, (0.0, 1.0), 0.5, 0.0)
+        features = [(3.0, 0.0, 0.0, 0.0, 0.0)] * 3
+        cues = shape_cues([hidden_play, hidden_stoppage, seen], features, model)
+        self.assertGreater(cues[0][HOME], 0.0)   # intercept 5.0 is ignored; feature logit 3 > 1.5
+        self.assertEqual(cues[0][AWAY], 0.0)
+        self.assertEqual(cues[1], [0.0, 0.0])
+        self.assertEqual(cues[2], [0.0, 0.0])
 
     def test_outside_ball_cannot_supply_player_control(self):
         with tempfile.TemporaryDirectory() as directory:
