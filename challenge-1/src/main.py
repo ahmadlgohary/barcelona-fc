@@ -19,6 +19,63 @@ from games import GAME, GAMES, half_video_blocks, require, source_frames
 HOME, AWAY, DEAD = range(3)
 LABELS = "HAD"
 STEP_FRAMES = 5
+# Field-wide stoppage cue. Activity is the share of tracked players moving at >= 2 m/s. During play
+# players are constantly repositioning; at a stoppage nearly everyone walks. Full evidence when at
+# most 1 in 20 players runs, none once 1 in 7 does, averaged over a 3 s window so a single slow
+# moment in open play does not count.
+QUIET_WINDOW_S = 3.0
+QUIET_FULL = 0.05
+QUIET_ZERO = 0.15
+QUIET_WEIGHT = 0.5             # per 0.2 s block; a 5 s stoppage outweighs entering and leaving D
+QUIET_CONTACT_DISCOUNT = 0.6
+# Laws of the Game, law 15-17: when the ball leaves the pitch, the team that did not touch it
+# last restarts (throw-in, goal kick or corner). Look back up to 3 s for the last clear contact.
+LAST_TOUCH_LOOKBACK_S = 3.0
+LAST_TOUCH_MIN = 0.25
+LAST_TOUCH_WEIGHT = 0.5
+RESTART_EVIDENCE_S = 1.2       # how long restart-team evidence lasts after play resumes
+# Law 8: after a goal the ball is dead until the conceding team kicks off.
+GOAL_DEAD = 1.5                # same strength as the lead-in to a half's opening kick-off
+GOAL_MAX_GAP_S = 180.0         # a kick-off later than this is not the one for that goal
+# Boundary refinement: decoding works in blocks, so each change is re-placed at frame precision
+# within one block either side, using the per-frame evidence for the two states involved.
+MOVING_BALL = 2.4              # m/s, same threshold as the block-level "moving" cue
+# Team shape while the ball is hidden. A classifier from shape to "who has the ball" is fitted on
+# this match's own frames where the ball is visible and one team is clearly on it (algorithmic
+# pseudo-labels, no human labels), then applied to blocks with no ball contact. Its intercept is
+# dropped and only confident outputs count, so a base rate cannot drift possession through long
+# gaps on its own. Per-block weight is low because neighbouring blocks are strongly correlated.
+SHAPE_MIN_PLAYERS = 7
+SHAPE_LABEL_CONTACT = 0.5      # pseudo-label: one team's contact at least this ...
+SHAPE_LABEL_MARGIN = 0.4       # ... and this much more than the other team's
+SHAPE_MIN_LOGIT = 1.5          # only |logit| beyond this (p > 0.82) is used
+SHAPE_WEIGHT = 0.15            # per block, per unit of logit beyond the threshold
+SHAPE_MAX_LOGIT = 4.0
+# Interceptions: the ball travels from a clear touch by one team to a clear touch by the other,
+# and the receiver keeps it. Possession changes at the reception, not a second later.
+TOUCH_CONTACT = 0.6
+TOUCH_OPPONENT_MAX = 0.2
+PASS_MIN_FRAMES = 3
+PASS_MAX_S = 3.0
+PASS_MIN_DISTANCE = 5.0        # m; shorter is a duel or a tackle, which contact already handles
+RECEPTION_WINDOW_S = 0.6
+RECEPTION_MIN_TOUCHES = 6      # frames of clear control within that window
+INTERCEPT_WEIGHT = 0.8
+INTERCEPT_EVIDENCE_S = 1.0
+# Free kicks: a stoppage in play that did not start with the ball going out is most often a foul,
+# and most fouls are committed by the team without the ball, so the team in possession restarts.
+# Offsides go the other way and are far rarer, hence a weaker weight than the last-touch rule.
+FOUL_RESTART_WEIGHT = 0.3
+FOUL_MIN_STOPPAGE_S = 2.0
+# Ball carrier: the same tracked player stays within CARRY_RADIUS of the ball, moving with it, for
+# at least CARRY_MIN_S. That is a player in control (dribbling, shielding, receiving and turning),
+# the challenge's own proxy for controlled possession, so that team's contact evidence is raised
+# to full strength. A tracker identity switch simply ends the run.
+CARRY_RADIUS = 1.5             # m
+CARRY_MIN_S = 0.5
+CARRY_VELOCITY_FRAMES = 2      # velocities over +-2 frames (0.16 s)
+CARRY_MAX_VELOCITY_DIFF = 2.0  # m/s between player and ball
+CARRY_CONTACT = 1.0            # the carrier's team contact is raised to this
 PHASE_WEIGHT = {
     "attacking transition": 0.32,
     "build up": 0.29,
@@ -39,6 +96,8 @@ class Observation(NamedTuple):
     ball: Optional[tuple]
     contact: tuple
     activity: float
+    shape: Optional[tuple] = None   # per team (mean x, mean y, sd x, sd y, min x, max x)
+    nearest: Optional[tuple] = None  # closest player to an on-pitch ball: (slot, team, metres, x, y)
 
 
 class Block(NamedTuple):
@@ -47,6 +106,7 @@ class Block(NamedTuple):
     contact: tuple
     activity: float
     outside: float
+    shape: Optional[tuple] = None
 
 
 class Tag(NamedTuple):
@@ -107,6 +167,18 @@ def contact_evidence(nearest, ball_speed):
     return tuple(result)
 
 
+def team_shape(moments):
+    """Per team (mean x, mean y, sd x, sd y, min x, max x), or None if either side is thin."""
+    result = []
+    for count, sx, sy, sxx, syy, low, high in moments:
+        if count < SHAPE_MIN_PLAYERS:
+            return None
+        mx, my = sx / count, sy / count
+        result.append((mx, my, math.sqrt(max(0.0, sxx / count - mx * mx)),
+                       math.sqrt(max(0.0, syy / count - my * my)), low, high))
+    return tuple(result)
+
+
 def read_tracking(path, slots, pitch, frame_count):
     data = []
     with open(path, encoding="utf-8-sig") as stream:
@@ -123,26 +195,84 @@ def read_tracking(path, slots, pitch, frame_count):
                 ball_on_pitch = ball is not None and not is_outside_pitch(ball, pitch)
                 nearest = [math.inf, math.inf]
                 running = speed_samples = 0
-                for team, group in zip(slots, groups):
+                # count, sum x, sum y, sum x^2, sum y^2, min x, max x per team
+                moments = [[0, 0.0, 0.0, 0.0, 0.0, math.inf, -math.inf] for _ in (HOME, AWAY)]
+                closest = None
+                for slot, (team, group) in enumerate(zip(slots, groups)):
                     player = coordinates(group, pitch)
                     if player is None:
                         continue
                     x, y, speed = player
+                    m = moments[team]
+                    m[0] += 1
+                    m[1] += x
+                    m[2] += y
+                    m[3] += x * x
+                    m[4] += y * y
+                    m[5] = min(m[5], x)
+                    m[6] = max(m[6], x)
                     if math.isfinite(speed) and speed >= 0.0:
                         speed_samples += 1
                         running += speed >= 2.0
                     if ball_on_pitch:
                         distance = math.hypot(x - ball[0], y - ball[1])
                         nearest[team] = min(nearest[team], distance)
+                        if closest is None or distance < closest[2]:
+                            closest = (slot, team, distance, x, y)
 
                 contact = contact_evidence(nearest, ball[2]) if ball_on_pitch else (0.0, 0.0)
                 activity = running / speed_samples if speed_samples >= 6 else math.nan
-                data.append(Observation(ball, contact, activity))
+                data.append(Observation(ball, contact, activity, team_shape(moments), closest))
             except ValueError as error:
                 raise ValueError(f"{path}, line {frame_id}: {error}") from error
     if len(data) != frame_count:
         raise ValueError(f"{path}: expected {frame_count} tactical records, found {len(data)}")
     return data
+
+
+def carrier_frames(tracking, fps):
+    """{frame: team} for frames inside a run where one tracked player carries the ball."""
+    k = CARRY_VELOCITY_FRAMES
+    together = [None] * len(tracking)
+    for f in range(k, len(tracking) - k):
+        here, before, after = (tracking[g].nearest for g in (f, f - k, f + k))
+        if (here is None or before is None or after is None or here[2] > CARRY_RADIUS
+                or not here[0] == before[0] == after[0]):
+            continue
+        ball_before, ball_after = tracking[f - k].ball, tracking[f + k].ball
+        seconds = 2 * k / fps
+        ball_velocity = ((ball_after[0] - ball_before[0]) / seconds,
+                         (ball_after[1] - ball_before[1]) / seconds)
+        player_velocity = ((after[3] - before[3]) / seconds, (after[4] - before[4]) / seconds)
+        if math.hypot(ball_velocity[0] - player_velocity[0],
+                      ball_velocity[1] - player_velocity[1]) <= CARRY_MAX_VELOCITY_DIFF:
+            together[f] = (here[0], here[1])
+
+    carriers = {}
+    minimum = round(CARRY_MIN_S * fps)
+    f = 0
+    while f < len(together):
+        if together[f] is None:
+            f += 1
+            continue
+        g = f
+        while g < len(together) and together[g] == together[f]:
+            g += 1
+        if g - f >= minimum:
+            for frame in range(f, g):
+                carriers[frame] = together[f][1]
+        f = g
+    return carriers
+
+
+def apply_carriers(tracking, fps):
+    """Tracking with contact evidence strengthened wherever a ball carrier is found."""
+    result = list(tracking)
+    for frame, team in carrier_frames(tracking, fps).items():
+        contact = list(result[frame].contact)
+        contact[team] = max(contact[team], CARRY_CONTACT)
+        result[frame] = result[frame]._replace(contact=tuple(contact))
+    return result
 
 
 def read_tags(path, team_names, fps):
@@ -188,8 +318,12 @@ def build_blocks(tracking, pitch, fps):
         activity = [item.activity for item in observations if math.isfinite(item.activity)]
         outside = sum(is_outside_pitch(ball, pitch) for ball in balls)
         position = (median(ball[0] for ball in balls), median(ball[1] for ball in balls)) if balls else None
+        shapes = [item.shape for item in observations if item.shape is not None]
+        shape = (tuple(tuple(sum(s[team][k] for s in shapes) / len(shapes) for k in range(6))
+                       for team in (HOME, AWAY)) if shapes else None)
         blocks.append(Block(position, median(speeds) if speeds else math.nan, contact,
-                            median(activity) if activity else math.nan, outside / len(observations)))
+                            median(activity) if activity else math.nan, outside / len(observations),
+                            shape))
     return blocks
 
 
@@ -250,13 +384,25 @@ def tag_evidence(blocks, first_frame, tags, pitch, blocks_per_second):
     restart_live = [0.0] * len(blocks)
     restart_dead = [0.0] * len(blocks)
     clip_end = first_frame + STEP_FRAMES * len(blocks)
+    goals = [tag for tag in tags if tag.code == "goals"]
     for tag in tags:
         if tag.end <= first_frame or tag.start >= clip_end or tag.end <= tag.start:
             continue
         start = (tag.start - first_frame) // STEP_FRAMES
         end = (tag.end - first_frame + STEP_FRAMES - 1) // STEP_FRAMES
         if tag.code == "set pieces":
+            goal = None
+            if tag.kind == "kick off (after goal)":
+                earlier = [g for g in goals if g.start < tag.start
+                           and tag.start - g.end <= GOAL_MAX_GAP_S * STEP_FRAMES * blocks_per_second]
+                goal = earlier[-1] if earlier else None
+                if tag.team is None and goal is not None and goal.team is not None:
+                    tag = tag._replace(team=1 - goal.team)  # the conceding side kicks off
             restart, confidence = align_restart(blocks, start, end, tag, pitch, blocks_per_second)
+            if goal is not None:
+                goal_end = max(0, (goal.end - first_frame) // STEP_FRAMES)
+                for i in range(goal_end, restart):
+                    restart_dead[i] = max(restart_dead[i], GOAL_DEAD)
             pre_window = round(24 * blocks_per_second)
             pre_start = max(0, restart - pre_window)
             if tag.kind == "kick off (start)" and restart < 180 * blocks_per_second:
@@ -279,10 +425,35 @@ def tag_evidence(blocks, first_frame, tags, pitch, blocks_per_second):
     return phases, restart_live, restart_dead
 
 
-def state_evidence(blocks, phases, restart_live, restart_dead, blocks_per_second):
+def smoothed_activity(blocks, blocks_per_second):
+    """Centred mean of team activity over QUIET_WINDOW_S seconds, ignoring missing samples."""
+    half = round(QUIET_WINDOW_S * blocks_per_second / 2)
+    total = [0.0]
+    count = [0]
+    for block in blocks:
+        valid = math.isfinite(block.activity)
+        total.append(total[-1] + (block.activity if valid else 0.0))
+        count.append(count[-1] + valid)
+    result = []
+    for i in range(len(blocks)):
+        low, high = max(0, i - half), min(len(blocks), i + half + 1)
+        samples = count[high] - count[low]
+        result.append((total[high] - total[low]) / samples if samples else math.nan)
+    return result
+
+
+def quiet_evidence(activity):
+    """1 when almost nobody runs, 0 at normal pace: the whole field stopping is a stoppage."""
+    if not math.isfinite(activity):
+        return 0.0
+    return min(1.0, max(0.0, (QUIET_ZERO - activity) / (QUIET_ZERO - QUIET_FULL)))
+
+
+def state_evidence(blocks, phases, restart_live, restart_dead, blocks_per_second, cues=None):
     emissions = []
     still_blocks = missing_blocks = 0
     recent_out = 0.0
+    field_activity = smoothed_activity(blocks, blocks_per_second)
     for i, block in enumerate(blocks):
         missing = block.ball is None
         moving = block.speed > 2.4 and block.outside < 0.4
@@ -311,13 +482,22 @@ def state_evidence(blocks, phases, restart_live, restart_dead, blocks_per_second
             dead += 0.055
         if not moving or restart_dead[i] >= 1.0:
             dead += restart_dead[i] * (1.0 if still or missing or quiet else 0.45)
+        # Field-wide stoppage: sustained walking pace with the ball not in motion. This needs no
+        # ball position, which matters because the ball is often untracked during stoppages, and
+        # most stoppages (fouls, many throw-ins) have no Smart Tagging set piece.
+        field_quiet = 0.0 if moving else quiet_evidence(field_activity[i])
+        dead += QUIET_WEIGHT * field_quiet
         dead -= 0.6 * restart_live[i]
         contact_multiplier = 1.20 * (1 - min(1.0, 2 * block.outside))
+        # A player standing over the ball while nobody runs is setting up a restart, not
+        # carrying a possession.
+        contact_multiplier *= 1 - QUIET_CONTACT_DISCOUNT * field_quiet
         if stationary or restart_dead[i] >= 1.0:
             # The player standing over a ball before an automated restart cue is
             # weaker evidence of live possession than a moving player's contact.
             contact_multiplier *= 1 - min(0.85, 1.6 * restart_dead[i])
-        team_evidence = [contact_multiplier * block.contact[side] + phases[i][side]
+        cue = cues[i] if cues is not None else (0.0, 0.0)
+        team_evidence = [contact_multiplier * block.contact[side] + phases[i][side] + cue[side]
                          for side in (HOME, AWAY)]
         # Only a team's advantage should count as possession evidence. Overlapping equally
         # strong tactical phases still supply a weak live-ball cue via the common term above.
@@ -327,15 +507,17 @@ def state_evidence(blocks, phases, restart_live, restart_dead, blocks_per_second
     return emissions
 
 
-def team_switch_cost(contact, phases, receiving_team):
+def team_switch_cost(contact, phases, receiving_team, cue=(0.0, 0.0)):
     control = contact[receiving_team]
     phase_advantage = max(0.0, phases[receiving_team] - phases[1 - receiving_team])
-    if control == 0.0 and phase_advantage == 0.0:
+    # Team shape and interceptions can also justify a handover where the ball gives no contact.
+    cue_advantage = max(0.0, cue[receiving_team] - cue[1 - receiving_team])
+    if control == 0.0 and phase_advantage == 0.0 and cue_advantage == 0.0:
         return math.inf
-    return 5.0 - 1.7 * control - phase_advantage
+    return 5.0 - 1.7 * control - phase_advantage - cue_advantage
 
 
-def decode_states(blocks, emissions, phases, restart_live, restart_dead):
+def decode_states(blocks, emissions, phases, restart_live, restart_dead, cues=None):
     """Viterbi decoding with switch costs and deterministic tie-breaking."""
     scores = (0.0, 0.0, 0.0)
     back = []
@@ -344,8 +526,9 @@ def decode_states(blocks, emissions, phases, restart_live, restart_dead):
         from_dead = max(0.8, 4.4 - 3.6 * restart_live[i])
         to_dead = 2.8 - min(1.3, restart_dead[i] + block.outside)
         # A direct handover needs evidence for the receiving side at the transition.
-        switch_to_home = team_switch_cost(block.contact, phases[i], HOME)
-        switch_to_away = team_switch_cost(block.contact, phases[i], AWAY)
+        cue = cues[i] if cues is not None else (0.0, 0.0)
+        switch_to_home = team_switch_cost(block.contact, phases[i], HOME, cue)
+        switch_to_away = team_switch_cost(block.contact, phases[i], AWAY, cue)
         choices = (
             ((scores[HOME], HOME), (scores[AWAY] - switch_to_home, AWAY),
              (scores[DEAD] - from_dead, DEAD)),
@@ -366,26 +549,317 @@ def decode_states(blocks, emissions, phases, restart_live, restart_dead):
     return list(reversed(path))
 
 
+def last_touch(blocks, out, blocks_per_second):
+    """Team with the last clear contact before the ball left the pitch at block `out`, or None."""
+    for i in range(out, max(-1, out - round(LAST_TOUCH_LOOKBACK_S * blocks_per_second)), -1):
+        home, away = blocks[i].contact
+        if max(home, away) >= LAST_TOUCH_MIN and abs(home - away) > 0.1:
+            return HOME if home > away else AWAY
+    return None
+
+
+def out_of_play_restarts(blocks, path, blocks_per_second):
+    """[(first live block, restarting team)] for stoppages that began with the ball going out."""
+    restarts = []
+    i = 0
+    while i < len(path):
+        if path[i] != DEAD:
+            i += 1
+            continue
+        j = i
+        while j < len(path) and path[j] == DEAD:
+            j += 1
+        if j < len(path):
+            window = range(max(0, i - round(2 * blocks_per_second)),
+                           min(j, i + round(5 * blocks_per_second)))
+            out = next((k for k in window if blocks[k].outside >= 0.4), None)
+            if out is not None:
+                toucher = last_touch(blocks, out, blocks_per_second)
+                if toucher is not None:
+                    restarts.append((j, 1 - toucher))
+        i = j
+    return restarts
+
+
+def foul_restarts(blocks, path, restart_dead, blocks_per_second):
+    """[(first live block, restarting team)] for stoppages in play that look like fouls.
+
+    Skips stoppages that began with the ball going out (out_of_play_restarts covers those),
+    stoppages near a goal or kick-off lead-in, and very short ones.
+    """
+    restarts = []
+    minimum = round(FOUL_MIN_STOPPAGE_S * blocks_per_second)
+    i = 0
+    while i < len(path):
+        if path[i] != DEAD:
+            i += 1
+            continue
+        j = i
+        while j < len(path) and path[j] == DEAD:
+            j += 1
+        if 0 < i and j < len(path) and path[i - 1] != DEAD and j - i >= minimum:
+            window = range(max(0, i - round(2 * blocks_per_second)),
+                           min(j, i + round(5 * blocks_per_second)))
+            went_out = any(blocks[k].outside >= 0.4 for k in window)
+            special = any(restart_dead[k] >= 1.0 for k in range(i, j))
+            if not went_out and not special:
+                restarts.append((j, path[i - 1]))
+        i = j
+    return restarts
+
+
+def attack_direction(blocks):
+    """+1 if the home team attacks towards x = pitch length in this half, else -1.
+
+    Each goalkeeper stays near the goal his team defends, so the team whose rearmost player sits
+    closer to x = 0 defends that end. Medians over the half make one bad frame irrelevant.
+    """
+    lows = [[], []]
+    for block in blocks:
+        if block.shape is not None:
+            for team in (HOME, AWAY):
+                lows[team].append(block.shape[team][4])
+    if not lows[HOME] or not lows[AWAY]:
+        return 1
+    return 1 if median(lows[HOME]) < median(lows[AWAY]) else -1
+
+
+def shape_features(shape, home_direction, pitch):
+    """Home-minus-away shape features, signed so that +1 always means the home attacking direction."""
+    if shape is None:
+        return None
+    (hx, hy, hsx, hsy, _, _), (ax, ay, asx, asy, _, _) = shape
+    return (
+        math.hypot(hsx, hsy) - math.hypot(asx, asy),      # overall spread
+        hsx - asx,                                         # length
+        hsy - asy,                                         # width
+        (hx - ax) * home_direction,                        # home block ahead of away block
+        ((hx + ax) / 2 - pitch[0] / 2) * home_direction,   # play in home's attacking half
+    )
+
+
+def solve(matrix, vector):
+    """Gaussian elimination with partial pivoting for a small dense system."""
+    n = len(vector)
+    a = [row[:] + [vector[i]] for i, row in enumerate(matrix)]
+    for col in range(n):
+        pivot = max(range(col, n), key=lambda r: abs(a[r][col]))
+        a[col], a[pivot] = a[pivot], a[col]
+        if abs(a[col][col]) < 1e-12:
+            continue
+        for r in range(n):
+            if r != col:
+                factor = a[r][col] / a[col][col]
+                for c in range(col, n + 1):
+                    a[r][c] -= factor * a[col][c]
+    return [a[i][n] / a[i][i] if abs(a[i][i]) > 1e-12 else 0.0 for i in range(n)]
+
+
+def fit_logistic(samples, labels, l2=1.0, iterations=25):
+    """Standardised L2 logistic regression by Newton's method. Returns (means, scales, weights)."""
+    k = len(samples[0])
+    means = [sum(x[j] for x in samples) / len(samples) for j in range(k)]
+    scales = [math.sqrt(sum((x[j] - means[j]) ** 2 for x in samples) / len(samples)) or 1.0
+              for j in range(k)]
+    rows = [[1.0] + [(x[j] - means[j]) / scales[j] for j in range(k)] for x in samples]
+    w = [0.0] * (k + 1)
+    for _ in range(iterations):
+        gradient = [0.0] * (k + 1)
+        hessian = [[0.0] * (k + 1) for _ in range(k + 1)]
+        for row, y in zip(rows, labels):
+            z = sum(wi * xi for wi, xi in zip(w, row))
+            p = 1 / (1 + math.exp(-max(-30.0, min(30.0, z))))
+            for a in range(k + 1):
+                gradient[a] += (y - p) * row[a]
+                for b in range(a, k + 1):
+                    hessian[a][b] += p * (1 - p) * row[a] * row[b]
+        for a in range(k + 1):
+            for b in range(a):
+                hessian[a][b] = hessian[b][a]
+            if a:
+                gradient[a] -= l2 * w[a]
+                hessian[a][a] += l2
+        step = solve(hessian, gradient)
+        w = [wi + si for wi, si in zip(w, step)]
+        if max(abs(si) for si in step) < 1e-6:
+            break
+    return means, scales, w
+
+
+def shape_logit(model, features):
+    """Feature part of the logit only: the intercept (base rate) is deliberately left out."""
+    means, scales, w = model
+    return sum(wj * (f - m) / s for wj, f, m, s in zip(w[1:], features, means, scales))
+
+
+def is_clear_control(block):
+    home, away = block.contact
+    return (max(home, away) >= SHAPE_LABEL_CONTACT and abs(home - away) >= SHAPE_LABEL_MARGIN
+            and block.outside == 0.0 and math.isfinite(block.activity) and block.activity >= 0.2)
+
+
+def fit_shape_model(halves):
+    """Fit on blocks with clear ball control, pooled over both halves. None if too few."""
+    samples, labels = [], []
+    for blocks, features in halves:
+        for block, feature in zip(blocks, features):
+            if feature is not None and is_clear_control(block):
+                samples.append(feature)
+                labels.append(1.0 if block.contact[HOME] > block.contact[AWAY] else 0.0)
+    if len(samples) < 200 or len(set(labels)) < 2:
+        return None
+    return fit_logistic(samples, labels)
+
+
+def shape_cues(blocks, features, model):
+    """Per-block [home, away] evidence from team shape, only where the ball gives none."""
+    cues = [[0.0, 0.0] for _ in blocks]
+    if model is None:
+        return cues
+    for i, (block, feature) in enumerate(zip(blocks, features)):
+        # Shape says who would have the ball, not whether it is in play: at a stoppage the ball is
+        # often hidden too, and the cue must not argue for live play there.
+        quiet = not math.isfinite(block.activity) or block.activity < QUIET_ZERO
+        if feature is None or max(block.contact) >= 0.1 or quiet:
+            continue
+        z = max(-SHAPE_MAX_LOGIT, min(SHAPE_MAX_LOGIT, shape_logit(model, feature)))
+        strength = SHAPE_WEIGHT * max(0.0, abs(z) - SHAPE_MIN_LOGIT)
+        if strength:
+            cues[i][HOME if z > 0 else AWAY] = strength
+    return cues
+
+
+def detect_interceptions(tracking, fps):
+    """[(frame, team)] where a pass or clearance by one team is received and kept by the other."""
+    touches = []
+    for f, observation in enumerate(tracking):
+        if observation.ball is None:
+            continue
+        home, away = observation.contact
+        if home >= TOUCH_CONTACT and away < TOUCH_OPPONENT_MAX:
+            touches.append((f, HOME))
+        elif away >= TOUCH_CONTACT and home < TOUCH_OPPONENT_MAX:
+            touches.append((f, AWAY))
+    max_gap = round(PASS_MAX_S * fps)
+    window = round(RECEPTION_WINDOW_S * fps)
+    found = []
+    for n in range(1, len(touches)):
+        (f0, sender), (f1, receiver) = touches[n - 1], touches[n]
+        if sender == receiver or not PASS_MIN_FRAMES <= f1 - f0 <= max_gap:
+            continue
+        a, b = tracking[f0].ball, tracking[f1].ball
+        if math.hypot(b[0] - a[0], b[1] - a[1]) < PASS_MIN_DISTANCE:
+            continue
+        kept = 0
+        m = n
+        while m < len(touches) and touches[m][0] < f1 + window:
+            kept += touches[m][1] == receiver
+            m += 1
+        if kept >= RECEPTION_MIN_TOUCHES:
+            found.append((f1, receiver))
+    return found
+
+
+def interception_cues(cues, interceptions, blocks_per_second):
+    span = max(1, round(INTERCEPT_EVIDENCE_S * blocks_per_second))
+    for frame, team in interceptions:
+        start = frame // STEP_FRAMES
+        for i in range(start, min(len(cues), start + span)):
+            cues[i][team] = max(cues[i][team], INTERCEPT_WEIGHT)
+    return cues
+
+
+def frame_score(observation, state, pitch):
+    """Per-frame evidence for one state, used only to place a boundary inside a block."""
+    ball = observation.ball
+    outside = ball is not None and is_outside_pitch(ball, pitch)
+    if state == DEAD:
+        return 1.0 if outside else 0.0
+    moving = (ball is not None and not outside and math.isfinite(ball[2])
+              and ball[2] > MOVING_BALL)
+    return observation.contact[state] + (1.0 if moving else 0.0)
+
+
+def refine_boundaries(path, tracking, pitch):
+    """Per-frame states, with every block boundary moved to the best frame within one block.
+
+    Only boundaries between two segments of at least two blocks are moved, so neighbouring
+    refinement windows never overlap. Ties keep the boundary closest to where decoding put it.
+    """
+    states = [state for state in path for _ in range(STEP_FRAMES)][:len(tracking)]
+    for b in range(2, len(path) - 1):
+        source, target = path[b - 1], path[b]
+        if source == target or path[b - 2] != source or path[b + 1] != target:
+            continue
+        boundary = b * STEP_FRAMES
+        low, high = boundary - STEP_FRAMES, min(boundary + STEP_FRAMES, len(tracking))
+        if boundary >= high:
+            continue
+        difference = [frame_score(tracking[f], target, pitch) - frame_score(tracking[f], source, pitch)
+                      for f in range(low, high)]
+        suffix = [0.0] * (len(difference) + 1)
+        for k in range(len(difference) - 1, -1, -1):
+            suffix[k] = suffix[k + 1] + difference[k]
+        base = suffix[boundary - low]
+        best, best_gain = boundary, 0.0
+        for frame in range(low, high + 1):
+            gain = suffix[frame - low] - base
+            if gain > best_gain + 1e-9 or (abs(gain - best_gain) <= 1e-9
+                                           and abs(frame - boundary) < abs(best - boundary)):
+                best, best_gain = frame, gain
+        for f in range(low, high):
+            states[f] = source if f < best else target
+    return states
+
+
 def predict(data_dir=None):
     metadata, raw_tracking, smart_tagging = require(
         ("atd_meta", "atd_raw", "smart_tagging"), data_dir=data_dir
     )
     config = GAMES[GAME]
     fps, pitch = config["fps"], config["pitch"]
+    blocks_per_second = fps / STEP_FRAMES
     frame_count = source_frames()
     slots, team_names = read_teams(metadata)
     tags = read_tags(smart_tagging, team_names, fps)
     tracking = read_tracking(raw_tracking, slots, pitch, frame_count)
     labels = ["X"] * frame_count
+
+    halves = []
     for _, first, last in half_video_blocks(GAME):
-        blocks = build_blocks(tracking[first:last + 1], pitch, fps)
-        tag_scores = tag_evidence(blocks, first, tags, pitch, fps / STEP_FRAMES)
-        emissions = state_evidence(blocks, *tag_scores, fps / STEP_FRAMES)
-        path = decode_states(blocks, emissions, *tag_scores)
-        for i, state in enumerate(path):
-            start = first + i * STEP_FRAMES
-            stop = min(start + STEP_FRAMES, last + 1)
-            labels[start:stop] = [LABELS[state]] * (stop - start)
+        half = apply_carriers(tracking[first:last + 1], fps)
+        blocks = build_blocks(half, pitch, fps)
+        direction = attack_direction(blocks)
+        features = [shape_features(block.shape, direction, pitch) for block in blocks]
+        halves.append((first, last, half, blocks, features))
+    shape_model = fit_shape_model([(blocks, features) for _, _, _, blocks, features in halves])
+
+    for first, last, half, blocks, features in halves:
+        tag_scores = tag_evidence(blocks, first, tags, pitch, blocks_per_second)
+        cues = shape_cues(blocks, features, shape_model)
+        interception_cues(cues, detect_interceptions(half, fps), blocks_per_second)
+        emissions = state_evidence(blocks, *tag_scores, blocks_per_second, cues)
+        path = decode_states(blocks, emissions, *tag_scores, cues)
+
+        # Second pass: give each stoppage its restarting side, then decode again. Ball out of
+        # play goes to the team that did not touch it last; a stoppage in play (most often a
+        # foul) goes, more weakly, to the team that had the ball.
+        phases, _, restart_dead = tag_scores
+        restarts = [(first_live, team, LAST_TOUCH_WEIGHT)
+                    for first_live, team in out_of_play_restarts(blocks, path, blocks_per_second)]
+        restarts += [(first_live, team, FOUL_RESTART_WEIGHT)
+                     for first_live, team in foul_restarts(blocks, path, restart_dead,
+                                                           blocks_per_second)]
+        span = round(RESTART_EVIDENCE_S * blocks_per_second)
+        for first_live, team, weight in restarts:
+            for i in range(first_live, min(len(blocks), first_live + span)):
+                phases[i][team] = max(phases[i][team], weight)
+        if restarts:
+            emissions = state_evidence(blocks, *tag_scores, blocks_per_second, cues)
+            path = decode_states(blocks, emissions, *tag_scores, cues)
+
+        states = refine_boundaries(path, half, pitch)
+        labels[first:last + 1] = [LABELS[state] for state in states]
     return labels
 
 
