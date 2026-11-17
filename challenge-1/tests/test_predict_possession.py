@@ -8,8 +8,8 @@ from pathlib import Path
 
 from games import GAME, half_video_blocks, source_frames
 from src.main import (AWAY, DEAD, HOME, Block, Observation, Tag, attack_direction, decode_states,
-                      out_of_play_restarts, read_tracking, refine_boundaries, shape_cues,
-                      state_evidence, tag_evidence)
+                      detect_interceptions, foul_restarts, out_of_play_restarts, read_tracking,
+                      refine_boundaries, shape_cues, state_evidence, tag_evidence)
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -147,6 +147,31 @@ class PossessionTest(unittest.TestCase):
         self.assertEqual(attack_direction([block] * 10), 1)
         flipped = Block(None, float("nan"), (0.0, 0.0), 0.5, 0.0, (away, home))
         self.assertEqual(attack_direction([flipped] * 10), -1)
+
+    def test_interception_is_found_at_the_reception(self):
+        def frame(x, contact):
+            return Observation((x, 34.0, 10.0), contact, 0.5)
+        tracking = ([frame(30.0, (1.0, 0.0))] * 10                       # home on the ball
+                    + [frame(30.0 + 2 * k, (0.0, 0.0)) for k in range(10)]  # pass in flight
+                    + [frame(52.0, (0.0, 1.0))] * 20)                     # away receives, keeps it
+        self.assertEqual(detect_interceptions(tracking, 25), [(20, AWAY)])
+        # A short poke between two players in a duel is not an interception.
+        duel = [frame(30.0, (1.0, 0.0))] * 10 + [frame(31.0, (0.0, 1.0))] * 20
+        self.assertEqual(detect_interceptions(duel, 25), [])
+
+    def test_stoppage_in_play_is_restarted_by_the_team_that_had_the_ball(self):
+        home_control = Block((60.0, 34.0), 4.0, (1.0, 0.0), 0.5, 0.0)
+        stopped = Block(None, float("nan"), (0.0, 0.0), 0.0, 0.0)
+        blocks = [home_control] * 10 + [stopped] * 30 + [home_control] * 10
+        path = [HOME] * 10 + [DEAD] * 30 + [AWAY] * 10
+        zeros = [0.0] * len(blocks)
+        self.assertEqual(foul_restarts(blocks, path, zeros, 5), [(40, HOME)])
+        # Not when the ball went out (the last-touch rule handles that) ...
+        out = Block((106.0, 34.0), 5.0, (0.0, 0.0), 0.3, 1.0)
+        self.assertEqual(foul_restarts([home_control] * 10 + [out] * 5 + [stopped] * 25
+                                       + [home_control] * 10, path, zeros, 5), [])
+        # ... and not around a goal or kick-off.
+        self.assertEqual(foul_restarts(blocks, path, [0.0] * 15 + [1.5] * 35, 5), [])
 
     def test_shape_cue_is_silent_at_stoppages_and_where_the_ball_is_seen(self):
         model = ([0.0] * 5, [1.0] * 5, [5.0, 1.0, 0.0, 0.0, 0.0, 0.0])  # logit = spread difference

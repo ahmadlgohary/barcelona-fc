@@ -51,6 +51,22 @@ SHAPE_LABEL_MARGIN = 0.4       # ... and this much more than the other team's
 SHAPE_MIN_LOGIT = 1.5          # only |logit| beyond this (p > 0.82) is used
 SHAPE_WEIGHT = 0.15            # per block, per unit of logit beyond the threshold
 SHAPE_MAX_LOGIT = 4.0
+# Interceptions: the ball travels from a clear touch by one team to a clear touch by the other,
+# and the receiver keeps it. Possession changes at the reception, not a second later.
+TOUCH_CONTACT = 0.6
+TOUCH_OPPONENT_MAX = 0.2
+PASS_MIN_FRAMES = 3
+PASS_MAX_S = 3.0
+PASS_MIN_DISTANCE = 5.0        # m; shorter is a duel or a tackle, which contact already handles
+RECEPTION_WINDOW_S = 0.6
+RECEPTION_MIN_TOUCHES = 6      # frames of clear control within that window
+INTERCEPT_WEIGHT = 0.8
+INTERCEPT_EVIDENCE_S = 1.0
+# Free kicks: a stoppage in play that did not start with the ball going out is most often a foul,
+# and most fouls are committed by the team without the ball, so the team in possession restarts.
+# Offsides go the other way and are far rarer, hence a weaker weight than the last-touch rule.
+FOUL_RESTART_WEIGHT = 0.3
+FOUL_MIN_STOPPAGE_S = 2.0
 PHASE_WEIGHT = {
     "attacking transition": 0.32,
     "build up": 0.29,
@@ -436,7 +452,7 @@ def state_evidence(blocks, phases, restart_live, restart_dead, blocks_per_second
 def team_switch_cost(contact, phases, receiving_team, cue=(0.0, 0.0)):
     control = contact[receiving_team]
     phase_advantage = max(0.0, phases[receiving_team] - phases[1 - receiving_team])
-    # Team shape can also justify a handover where the ball gives no contact.
+    # Team shape and interceptions can also justify a handover where the ball gives no contact.
     cue_advantage = max(0.0, cue[receiving_team] - cue[1 - receiving_team])
     if control == 0.0 and phase_advantage == 0.0 and cue_advantage == 0.0:
         return math.inf
@@ -503,6 +519,33 @@ def out_of_play_restarts(blocks, path, blocks_per_second):
                 toucher = last_touch(blocks, out, blocks_per_second)
                 if toucher is not None:
                     restarts.append((j, 1 - toucher))
+        i = j
+    return restarts
+
+
+def foul_restarts(blocks, path, restart_dead, blocks_per_second):
+    """[(first live block, restarting team)] for stoppages in play that look like fouls.
+
+    Skips stoppages that began with the ball going out (out_of_play_restarts covers those),
+    stoppages near a goal or kick-off lead-in, and very short ones.
+    """
+    restarts = []
+    minimum = round(FOUL_MIN_STOPPAGE_S * blocks_per_second)
+    i = 0
+    while i < len(path):
+        if path[i] != DEAD:
+            i += 1
+            continue
+        j = i
+        while j < len(path) and path[j] == DEAD:
+            j += 1
+        if 0 < i and j < len(path) and path[i - 1] != DEAD and j - i >= minimum:
+            window = range(max(0, i - round(2 * blocks_per_second)),
+                           min(j, i + round(5 * blocks_per_second)))
+            went_out = any(blocks[k].outside >= 0.4 for k in window)
+            special = any(restart_dead[k] >= 1.0 for k in range(i, j))
+            if not went_out and not special:
+                restarts.append((j, path[i - 1]))
         i = j
     return restarts
 
@@ -628,6 +671,46 @@ def shape_cues(blocks, features, model):
     return cues
 
 
+def detect_interceptions(tracking, fps):
+    """[(frame, team)] where a pass or clearance by one team is received and kept by the other."""
+    touches = []
+    for f, observation in enumerate(tracking):
+        if observation.ball is None:
+            continue
+        home, away = observation.contact
+        if home >= TOUCH_CONTACT and away < TOUCH_OPPONENT_MAX:
+            touches.append((f, HOME))
+        elif away >= TOUCH_CONTACT and home < TOUCH_OPPONENT_MAX:
+            touches.append((f, AWAY))
+    max_gap = round(PASS_MAX_S * fps)
+    window = round(RECEPTION_WINDOW_S * fps)
+    found = []
+    for n in range(1, len(touches)):
+        (f0, sender), (f1, receiver) = touches[n - 1], touches[n]
+        if sender == receiver or not PASS_MIN_FRAMES <= f1 - f0 <= max_gap:
+            continue
+        a, b = tracking[f0].ball, tracking[f1].ball
+        if math.hypot(b[0] - a[0], b[1] - a[1]) < PASS_MIN_DISTANCE:
+            continue
+        kept = 0
+        m = n
+        while m < len(touches) and touches[m][0] < f1 + window:
+            kept += touches[m][1] == receiver
+            m += 1
+        if kept >= RECEPTION_MIN_TOUCHES:
+            found.append((f1, receiver))
+    return found
+
+
+def interception_cues(cues, interceptions, blocks_per_second):
+    span = max(1, round(INTERCEPT_EVIDENCE_S * blocks_per_second))
+    for frame, team in interceptions:
+        start = frame // STEP_FRAMES
+        for i in range(start, min(len(cues), start + span)):
+            cues[i][team] = max(cues[i][team], INTERCEPT_WEIGHT)
+    return cues
+
+
 def frame_score(observation, state, pitch):
     """Per-frame evidence for one state, used only to place a boundary inside a block."""
     ball = observation.ball
@@ -696,17 +779,23 @@ def predict(data_dir=None):
     for first, last, half, blocks, features in halves:
         tag_scores = tag_evidence(blocks, first, tags, pitch, blocks_per_second)
         cues = shape_cues(blocks, features, shape_model)
+        interception_cues(cues, detect_interceptions(half, fps), blocks_per_second)
         emissions = state_evidence(blocks, *tag_scores, blocks_per_second, cues)
         path = decode_states(blocks, emissions, *tag_scores, cues)
 
-        # Second pass: a stoppage that began with the ball going out is restarted by the team
-        # that did not touch it last. Add that evidence where play resumes and decode again.
-        phases = tag_scores[0]
-        restarts = out_of_play_restarts(blocks, path, blocks_per_second)
+        # Second pass: give each stoppage its restarting side, then decode again. Ball out of
+        # play goes to the team that did not touch it last; a stoppage in play (most often a
+        # foul) goes, more weakly, to the team that had the ball.
+        phases, _, restart_dead = tag_scores
+        restarts = [(first_live, team, LAST_TOUCH_WEIGHT)
+                    for first_live, team in out_of_play_restarts(blocks, path, blocks_per_second)]
+        restarts += [(first_live, team, FOUL_RESTART_WEIGHT)
+                     for first_live, team in foul_restarts(blocks, path, restart_dead,
+                                                           blocks_per_second)]
         span = round(RESTART_EVIDENCE_S * blocks_per_second)
-        for first_live, team in restarts:
+        for first_live, team, weight in restarts:
             for i in range(first_live, min(len(blocks), first_live + span)):
-                phases[i][team] = max(phases[i][team], LAST_TOUCH_WEIGHT)
+                phases[i][team] = max(phases[i][team], weight)
         if restarts:
             emissions = state_evidence(blocks, *tag_scores, blocks_per_second, cues)
             path = decode_states(blocks, emissions, *tag_scores, cues)
